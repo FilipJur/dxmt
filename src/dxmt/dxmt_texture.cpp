@@ -196,7 +196,7 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
   auto texture = flags.test(TextureAllocationFlag::Shared) ? device_.newSharedTexture(info) : device_.newTexture(info);
   auto *ta = new TextureAllocation(this, std::move(texture), info, flags);
   ta->census_owner_ = MEMOWN_TEX_PRIVATE;                  /* ml677 */
-  ta->census_bytes_ = mem_census_texture_bytes(info);
+  ta->census_bytes_ = mem_census_texture_bytes(info, device_.supportsBCTextureCompression());
   mem_census_add(MEMOWN_TEX_PRIVATE, ta->census_bytes_);
   return ta;
 }

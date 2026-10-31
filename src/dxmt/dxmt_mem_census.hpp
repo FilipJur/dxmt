@@ -231,39 +231,85 @@ mem_census_sub(MemOwner o, uint64_t bytes) {
   g_mem_census.live[o].fetch_sub(bytes, std::memory_order_relaxed);
 }
 
-/* Physical bytes a texture will actually occupy. On A15 every BC format is
- * remapped by remap_unsupported_bc() before Metal ever sees it, so the cost is
- * the DECODED size -- which is the entire point of measuring: BC1->RGBA8 is 8x,
- * BC6H->RGBA16F is 8x, BC7->RGBA8 is 4x. Counting compressed bytes here would
- * hide exactly the expansion we are hunting. */
-inline uint32_t
-mem_census_texel_bytes(enum WMTPixelFormat f) {
+/* Physical bytes a texture will actually occupy, per the remap decision the
+ * C++ side already knows (device.supportsBCTextureCompression(), mirroring
+ * remap_unsupported_bc() in winemetal_unix.c):
+ *
+ * - NATIVE (bc_supported, e.g. A17): BC is sampled as-is, so the cost is the
+ *   COMPRESSED size -- BC1/BC4 pack 16 texels into 8 bytes (0.5 B/texel),
+ *   every other BC format into 16 bytes (1 B/texel).
+ * - REMAPPED (!bc_supported, e.g. A15): every BC format was swapped for an
+ *   uncompressed physical format before Metal saw it, so the cost is the
+ *   DECODED size -- BC1/BC2/BC3/BC7 ride as RGBA8 (4 B), BC4 as R8 (1 B),
+ *   BC5 as RG8 (2 B), BC6H as RGBA16F (8 B). That expansion is the point of
+ *   measuring: BC1->RGBA8 is 8x, BC6H->RGBA16F is 8x.
+ *
+ * bc_supported has NO default: every caller passes its device value
+ * explicitly, because guessing wrong in either direction is a 2-8x census
+ * error. (The old code charged decoded sizes unconditionally, inflating
+ * native BC1 8x -- the phantom gigabytes that misled the Ebb investigation.)
+ *
+ * The fractional compressed sizes are exact: every cost is an integer or x.5
+ * B/texel, both exactly representable, and texel counts stay far below 2^53,
+ * so w*h*d*bpp is exact and only odd-texel-count native-BC mips lose up to
+ * half a byte to truncation. */
+inline double
+mem_census_texel_bytes(enum WMTPixelFormat f, bool bc_supported) {
+  if (bc_supported) {
+    switch (f) {
+    case WMTPixelFormatBC1_RGBA: case WMTPixelFormatBC1_RGBA_sRGB:
+    case WMTPixelFormatBC4_RUnorm: case WMTPixelFormatBC4_RSnorm:
+      return 0.5;   /* 8-byte block  */
+    case WMTPixelFormatBC2_RGBA: case WMTPixelFormatBC2_RGBA_sRGB:
+    case WMTPixelFormatBC3_RGBA: case WMTPixelFormatBC3_RGBA_sRGB:
+    case WMTPixelFormatBC5_RGUnorm: case WMTPixelFormatBC5_RGSnorm:
+    case WMTPixelFormatBC6H_RGBFloat: case WMTPixelFormatBC6H_RGBUfloat:
+    case WMTPixelFormatBC7_RGBAUnorm: case WMTPixelFormatBC7_RGBAUnorm_sRGB:
+      return 1.0;   /* 16-byte block */
+    default:
+      break;
+    }
+  } else {
+    /* Mirrors remap_unsupported_bc(): the physical format after the swap. */
+    switch (f) {
+    case WMTPixelFormatBC1_RGBA: case WMTPixelFormatBC1_RGBA_sRGB:
+    case WMTPixelFormatBC2_RGBA: case WMTPixelFormatBC2_RGBA_sRGB:
+    case WMTPixelFormatBC3_RGBA: case WMTPixelFormatBC3_RGBA_sRGB:
+    case WMTPixelFormatBC7_RGBAUnorm: case WMTPixelFormatBC7_RGBAUnorm_sRGB:
+      return 4.0;   /* RGBA8   */
+    case WMTPixelFormatBC4_RUnorm: case WMTPixelFormatBC4_RSnorm:
+      return 1.0;   /* R8      */
+    case WMTPixelFormatBC5_RGUnorm: case WMTPixelFormatBC5_RGSnorm:
+      return 2.0;   /* RG8     */
+    case WMTPixelFormatBC6H_RGBFloat: case WMTPixelFormatBC6H_RGBUfloat:
+      return 8.0;   /* RGBA16F */
+    default:
+      break;
+    }
+  }
   switch (f) {
-  case WMTPixelFormatBC4_RUnorm: case WMTPixelFormatBC4_RSnorm:
   case WMTPixelFormatR8Unorm: case WMTPixelFormatR8Snorm:
   case WMTPixelFormatA8Unorm: case WMTPixelFormatR8Uint: case WMTPixelFormatR8Sint:
-    return 1;
-  case WMTPixelFormatBC5_RGUnorm: case WMTPixelFormatBC5_RGSnorm:
+    return 1.0;
   case WMTPixelFormatRG8Unorm: case WMTPixelFormatRG8Snorm:
   case WMTPixelFormatR16Float: case WMTPixelFormatR16Uint: case WMTPixelFormatR16Sint:
   case WMTPixelFormatR16Unorm: case WMTPixelFormatR16Snorm:
   case WMTPixelFormatDepth16Unorm:
-    return 2;
-  case WMTPixelFormatBC6H_RGBFloat: case WMTPixelFormatBC6H_RGBUfloat:
+    return 2.0;
   case WMTPixelFormatRGBA16Float: case WMTPixelFormatRGBA16Uint:
   case WMTPixelFormatRGBA16Sint: case WMTPixelFormatRGBA16Unorm:
   case WMTPixelFormatRG32Float: case WMTPixelFormatRG32Uint: case WMTPixelFormatRG32Sint:
-    return 8;
+    return 8.0;
   case WMTPixelFormatRGBA32Float: case WMTPixelFormatRGBA32Uint: case WMTPixelFormatRGBA32Sint:
-    return 16;
+    return 16.0;
   default:
-    return 4;   /* RGBA8/BGRA8/BC1/BC2/BC3/BC7-as-RGBA8/depth32/etc. */
+    return 4.0;   /* RGBA8/BGRA8/depth32/etc. */
   }
 }
 
 inline uint64_t
-mem_census_texture_bytes(const WMTTextureInfo &info) {
-  const uint32_t bpp = mem_census_texel_bytes(info.pixel_format);
+mem_census_texture_bytes(const WMTTextureInfo &info, bool bc_supported) {
+  const double bpp = mem_census_texel_bytes(info.pixel_format, bc_supported);
   const uint32_t levels = info.mipmap_level_count ? info.mipmap_level_count : 1u;
   const uint32_t slices = info.array_length ? info.array_length : 1u;
   const uint32_t samples = info.sample_count ? info.sample_count : 1u;
@@ -272,7 +318,7 @@ mem_census_texture_bytes(const WMTTextureInfo &info) {
     uint32_t w = info.width  >> l ? info.width  >> l : 1u;
     uint32_t h = info.height >> l ? info.height >> l : 1u;
     uint32_t d = info.depth  >> l ? info.depth  >> l : 1u;
-    total += (uint64_t)w * h * d * bpp;
+    total += (uint64_t)((uint64_t)w * h * d * bpp);
   }
   return total * slices * samples;
 }
