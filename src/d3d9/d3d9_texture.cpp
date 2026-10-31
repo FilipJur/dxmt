@@ -498,6 +498,11 @@ void
 MTLD3D9Texture::stageMirrorLevel(uint32_t level, LONG l, LONG t, LONG r, LONG b) {
   if (level >= m_levels.size() || m_mirrorBacking == nullptr)
     return;
+  // ml2000: a clamped-away level has no physical storage (stageTextureUpload
+  // would drop it too); extents and the mirror stay logical, so there is
+  // nothing further to do for it here.
+  if (level < m_mipBias)
+    return;
   const LONG lw = static_cast<LONG>(std::max<UINT>(1u, m_width >> level));
   const LONG lh = static_cast<LONG>(std::max<UINT>(1u, m_height >> level));
   const bool compressed = IsCompressedFormat(m_format);

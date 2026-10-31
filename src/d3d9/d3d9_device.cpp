@@ -37,6 +37,10 @@
 #include "d3d9_vertex_declaration.hpp"
 #include "dxmt_bcn.hpp"
 #include "dxmt_command_queue.hpp"
+#include "../d3d11/d3d11_mip_clamp_policy.hpp"   /* ml2000: D3D9 BC clamp reuses the d3d11 policy math */
+#include "config/config.hpp"   /* ml2000: d3d9.mipClampBC / d3d9.mipClampAuto(MB) */
+#include "dxmt_madeira_headroom.hpp"   /* ml2000: shared MadeiraCtl op-7 headroom query */
+#include "util_madeira_switch.hpp"   /* ml2000: kMadeira32BitModule default */
 #include "util_futex.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
@@ -82,8 +86,92 @@ static_assert(kSbcMaxVsConstF == D3D9_MAX_VS_CONST_F, "");
 static_assert(kSbcMaxPsConstF == D3D9_MAX_PS_CONST_F, "");
 static_assert(kSbcMaxTextureUnits == D3D9_MAX_TEXTURE_UNITS, "");
 
-namespace {
+/* ml2000: per-create D3D9 BC mip-clamp policy, mirroring the d3d11 one
+ * (d3d11_texture_device.cpp:450-533). d3d9.mipClampBC=N applies to every
+ * eligible texture; d3d9.mipClampAuto (a Madeira switch: default on only in
+ * the i386 build) applies bias 1 only to LARGE ones, and only while the
+ * process is within d3d9.mipClampAutoMB (default 1536) of its memory limit,
+ * as reported by MadeiraCtl op 7 through dxmt_madeira_headroom.hpp.
+ * Where the query is unavailable the reading is marked unavailable once and
+ * nothing is ever auto-clamped. */
+struct D3D9MipClampAutoConfig {
+  bool enabled;
+  uint32_t threshold_mb;
+};
 
+static const D3D9MipClampAutoConfig &
+GetD3D9MipClampAutoConfig() {
+  static const D3D9MipClampAutoConfig cfg = [] {
+    D3D9MipClampAutoConfig c;
+    const std::string opt = Config::getInstance().getOption<std::string>("d3d9.mipClampAuto", "");
+    const std::string env_v = env::getEnvVar("MADEIRA_D3D9_MIP_CLAMP_AUTO");
+    if (mip_clamp::IsOffValue(opt.c_str()) || mip_clamp::IsOffValue(env_v.c_str()))
+      c.enabled = false;
+    else if (!opt.empty() || !env_v.empty())
+      c.enabled = true;
+    else
+      c.enabled = kMadeira32BitModule;
+    c.threshold_mb = (uint32_t)std::max(0, Config::getInstance().getOption<int>("d3d9.mipClampAutoMB", 1536));
+    if (c.enabled)
+      ERR("[mip-clamp] ml2000 d3d9 auto on threshold=", c.threshold_mb,
+          " MB (d3d9.mipClampAuto=0 or MADEIRA_D3D9_MIP_CLAMP_AUTO=0 disables; d3d9.mipClampAutoMB sets the threshold)");
+    return c;
+  }();
+  return cfg;
+}
+
+static std::atomic<uint64_t> g_d3d9_auto_candidates{0};
+static std::atomic<uint64_t> g_d3d9_auto_clamped{0};
+static std::atomic<int64_t> g_d3d9_auto_headroom_mb{kMadeiraHeadroomUnknown};
+static std::atomic<int64_t> g_d3d9_auto_footprint_mb{0};
+static std::atomic<bool> g_d3d9_auto_pressure_logged{false};
+
+/* Bias for an auto candidate already known to pass the mipClampBC filter. */
+static uint32_t
+D3D9MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
+  const D3D9MipClampAutoConfig &cfg = GetD3D9MipClampAutoConfig();
+  if (!cfg.enabled || !cfg.threshold_mb || !mip_clamp::AutoSizeEligible(width, height))
+    return 0;
+  const uint32_t bias = mip_clamp::ClampBias(1, width, height, mip_levels, true);
+  if (!bias)
+    return 0;
+
+  const uint64_t n = g_d3d9_auto_candidates.fetch_add(1, std::memory_order_relaxed) + 1;
+  int64_t headroom = g_d3d9_auto_headroom_mb.load(std::memory_order_relaxed);
+  if (mip_clamp::ShouldRequery(n, headroom, cfg.threshold_mb)) {
+    int64_t foot = 0;
+    const int64_t fresh = QueryMadeiraHeadroomMB(&foot);
+    if (fresh == kMadeiraHeadroomUnavailable && headroom == kMadeiraHeadroomUnknown)
+      ERR("[mip-clamp] ml2000 d3d9 auto: memory headroom unavailable here; auto clamp inactive");
+    headroom = fresh;
+    g_d3d9_auto_headroom_mb.store(headroom, std::memory_order_relaxed);
+    g_d3d9_auto_footprint_mb.store(foot, std::memory_order_relaxed);
+  }
+
+  const bool pressure = mip_clamp::UnderPressure(headroom, cfg.threshold_mb);
+  /* Log each entry into and exit from the pressure region once. */
+  bool was = g_d3d9_auto_pressure_logged.load(std::memory_order_relaxed);
+  if (pressure != was && g_d3d9_auto_pressure_logged.compare_exchange_strong(was, pressure))
+    ERR("[mip-clamp] ml2000 auto headroom=", headroom, " MB footprint=",
+        g_d3d9_auto_footprint_mb.load(std::memory_order_relaxed), " MB -> ", pressure ? "clamping" : "not clamping",
+        " large BC textures (threshold ", cfg.threshold_mb, " MB) clamped=",
+        g_d3d9_auto_clamped.load(std::memory_order_relaxed));
+  if (!pressure)
+    return 0;
+
+  const uint64_t clamped = g_d3d9_auto_clamped.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (mip_clamp::ShouldLogClamp(clamped))
+    ERR("[mip-clamp] ml2000 auto headroom=", headroom, " MB clamped=", clamped, " (", width, "x", height, " mips ",
+        mip_levels, " -> ", width >> bias, "x", height >> bias, " mips ", mip_levels - bias, ")");
+  return bias;
+}
+// Close the file-local anonymous namespace: the policy helpers above use
+// Config/env/ERR unqualified (as the rest of the TU does after the namespace
+// reopens below). Reopen it for the vtable-capture helpers that follow.
+} // namespace
+
+namespace dxmt {
+namespace {
 // SetTexture and UpdateTexture receive an app-owned IDirect3DBaseTexture9 and must
 // not call through its vtable to identify it: a wrapped or hostile vtable (some
 // overlays install one, and the conformance path for this deliberately corrupts it)
@@ -1444,8 +1532,20 @@ MTLD3D9Device::stageTextureUpload(
     WMTSize size, const void *src, uint32_t src_pitch, bool is_compressed, uint32_t src_slice_pitch,
     uint32_t src_row_bytes
 ) {
+  // ml2000 (D3D9 BC mip clamp): the D3D descriptor stays LOGICAL while the
+  // Metal texture is smaller. The op queued below carries the LOGICAL mip
+  // index; only the encode-thread EmitBufferToTextureOp_d9 translates it to
+  // physical (single translation point, the d3d11 UpdateTexture shape,
+  // d3d11_context_impl.cpp:4450-4515/4656-4664). The null/handle guard stays
+  // FIRST: m_dxmtTexture is nullable for texture-less packed-YUV SCRATCH
+  // surfaces, which is what the guard exists for.
   if (dst_alloc == nullptr || dst.handle == 0 || src == nullptr || src_pitch == 0 || size.width == 0 ||
       size.height == 0)
+    return;
+  // Drop uploads to levels that no longer exist physically (a clamped-away
+  // top level keeps its logical mirror but has no GPU texels); everything
+  // else rides the op stream with its logical index intact.
+  if (mip_level < dst_alloc->mipBias())
     return;
   // 3Dc fiction to BC reality: callers speak the app-facing linear layout
   // for ATI1/ATI2 (one byte per pixel, d3d9_format.cpp), while the Metal
@@ -1674,7 +1774,17 @@ MTLD3D9Device::readbackSurfaceMirrors(MTLD3D9Surface *const *surfaces, size_t co
       const auto src = surface->metalTexture().handle;
       const auto dst = span.handle;
       const auto offset = span.offset + copy.offset;
-      const auto mip = surface->mipLevel(), slice = surface->arraySlice();
+      // ml2000: cmd.level is a PHYSICAL Metal level; the surface's mipLevel()
+      // is LOGICAL. A clamped-away level has no GPU texels; only clamped
+      // DEFAULT-pool sampled textures reach here with a bias, and their
+      // LockRect path is served by the logical mirror (materialize) rather
+      // than this blit, so translate defensively and skip what has nowhere
+      // to read from.
+      const uint32_t rb_bias = surface->dxmtTexture() ? surface->dxmtTexture()->mipBias() : 0;
+      const auto mip_logical = surface->mipLevel(), slice = surface->arraySlice();
+      if (mip_logical < rb_bias)
+        continue;
+      const auto mip = mip_logical - rb_bias;
       const auto pitch = copy.pitch, rows = copy.rows;
       chunk->emitcc([texture = std::move(texture), src, dst, offset, mip, slice, pitch, rows,
                      width = desc.Width, height = desc.Height](ArgumentEncodingContext &ctx) mutable {
@@ -3091,6 +3201,42 @@ MTLD3D9Device::CreateTexture(
   if (Usage & D3DUSAGE_AUTOGENMIPMAP) {
     app_levels = 1;
   }
+  // ml2000 (D3D9 BC mip clamp): PHYSICAL mip clamp, mirroring ml675
+  // (d3d11_texture_device.cpp:546-607). Dropping top mips is the cheapest way
+  // back under the jetsam limit on a device that must decode BC: for a full
+  // chain, dropping level 0 leaves 25% of the chain's bytes. Only the PHYSICAL
+  // Metal texture shrinks (metal_levels / info / phys dims); the D3D descriptor
+  // (app_levels, surfaces, mirror, GetLevelDesc/GetLevelCount) stays LOGICAL,
+  // and every Metal index translates through the bias at the boundary
+  // (stageTextureUpload / PendingBlitOp emitters / deriveSampleView).
+  uint32_t mip_bias = 0;
+  // Clampable: BC (incl. 3Dc ATI1/2, real BC4/5 storage) sampled DEFAULT-pool
+  // textures; never RT/DS/autogen/DYNAMIC, never YUV/mirror-only (returned
+  // above). DYNAMIC is per-frame CPU-streamed (d3d11 gates the same way:
+  // Usage == DEFAULT || IMMUTABLE, no CPU access); clamping it would drop the
+  // app's streaming writes to a level with no physical storage.
+  if ((IsCompressedFormat(Format) || Is3DcFormat(Format)) && Pool == D3DPOOL_DEFAULT &&
+      !(Usage & D3DUSAGE_RENDERTARGET) && !(Usage & D3DUSAGE_DEPTHSTENCIL) && !(Usage & D3DUSAGE_AUTOGENMIPMAP) &&
+      !(Usage & D3DUSAGE_DYNAMIC) && metal_levels >= 2 && Width >= 8 && Height >= 8) {
+    static int cached_clamp = -1;
+    if (cached_clamp < 0)
+      cached_clamp = std::max(0, std::min(4, Config::getInstance().getOption<int>("d3d9.mipClampBC", 0)));
+    if (cached_clamp) {
+      mip_bias = mip_clamp::ClampBias((uint32_t)cached_clamp, Width, Height, metal_levels, true);
+      if (mip_bias) {
+        static uint32_t clamp_n;
+        if (++clamp_n <= 8 || (clamp_n % 256) == 0)
+          ERR("[mip-clamp] ml2000 d3d9 #", clamp_n, " logical ", Width, "x", Height, " mips ", real_levels,
+              " -> physical ", Width >> mip_bias, "x", Height >> mip_bias, " mips ", metal_levels - mip_bias,
+              " pool=", Pool);
+      }
+    } else {
+      mip_bias = D3D9MipClampAutoBias(Width, Height, metal_levels);
+    }
+    if (mip_bias) {
+      metal_levels -= mip_bias;
+    }
+  }
 
   // Packed-YUV SCRATCH texture: no Metal format, so there is no backing
   // dxmt::Texture. Build it mirror-only (null allocation); the level
@@ -3152,8 +3298,12 @@ MTLD3D9Device::CreateTexture(
 
   WMTTextureInfo info{};
   info.pixel_format = pixelFormat;
-  info.width = Width;
-  info.height = Height;
+  // ml2000: PHYSICAL dims (logical Width/Height shifted by the bias; logical
+  // mip N == physical mip N-bias, d3d11_texture_device.cpp:600-605). The D3D
+  // descriptor reported to the app (level descs, GetLevelCount) keeps the
+  // logical size.
+  info.width = mip_bias ? std::max(1u, Width >> mip_bias) : Width;
+  info.height = mip_bias ? std::max(1u, Height >> mip_bias) : Height;
   info.depth = 1;
   info.array_length = 1;
   info.type = WMTTextureType2D;
@@ -3198,6 +3348,12 @@ MTLD3D9Device::CreateTexture(
       return D3DERR_OUTOFVIDEOMEMORY;
     dxmt_texture->rename(std::move(allocation));
   }
+  // ml2000: publish the bias on both the allocation (encode-thread readers:
+  // stageTextureUpload/emit paths read dxmt::Texture::mipBias) and the D3D9
+  // wrapper (calling-thread readers: MTLD3D9Texture::mipBias), mirroring
+  // d3d11_texture_device.cpp:613 (texture->setMipBias). The wrapper stays in
+  // sync for the life of the texture; nothing re-biases after create.
+  dxmt_texture->setMipBias(mip_bias);
 
   // A freshly-allocated Metal texture holds undefined (recycled) contents, so a
   // sample before the app's first fill would read stale memory. UnlockRect
@@ -3213,6 +3369,7 @@ MTLD3D9Device::CreateTexture(
   auto *tex = new MTLD3D9Texture(
       this, Width, Height, app_levels, Usage, Format, Pool, std::move(dxmt_texture), backingPitch, user_memory
   );
+  tex->setMipBias(mip_bias);
   captureTextureLeafVtable(tex, kLeaf2D);
   if (Pool == D3DPOOL_DEFAULT)
     tex->markLosable();
@@ -4256,7 +4413,12 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
       if (sbpp == 0 || dbpp == 0)
         return D3D_OK;
       const UINT loose_levels = std::min(src_levels, dst_levels);
+      const uint32_t loose_dst_bias = dst->mipBias();
       for (UINT level = 0; level < loose_levels; ++level) {
+        // ml2000: see the strict loop below; clamped-away dst levels have no
+        // physical storage (stageTextureUpload drops them too).
+        if (level < loose_dst_bias)
+          continue;
         D3DSURFACE_DESC sd{}, dd{};
         if (FAILED(src->GetLevelDesc(level, &sd)) || FAILED(dst->GetLevelDesc(level, &dd)))
           continue;
@@ -4318,7 +4480,14 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
     // (a plain DEFAULT dst has none and is served by readback instead).
     dst->ensureMirror();
     uint8_t *dst_mirror = static_cast<uint8_t *>(dst->mirrorBase());
+    // ml2000: the destination may be clamped (SYSTEMMEM sources never are:
+    // clamp policy is DEFAULT-pool only). A clamped-away dst level has no
+    // physical storage; skip it and keep its logical mirror copy below (the
+    // mirror is logical-sized, stageTextureUpload drops it too).
+    const uint32_t ut_dst_bias = dst->mipBias();
     for (UINT dst_level = 0; dst_level < levels_to_copy; ++dst_level) {
+      if (dst_level < ut_dst_bias)
+        continue;
       const UINT src_level = src_level_offset + dst_level;
       D3DSURFACE_DESC d{};
       if (FAILED(src->GetLevelDesc(src_level, &d)))
@@ -4880,6 +5049,17 @@ MTLD3D9Device::GetRenderTargetData(IDirect3DSurface9 *pRenderTarget, IDirect3DSu
   obj_handle_t src_texture_handle = src->metalTexture().handle;
   obj_handle_t dst_buffer_handle = dst->metalBuffer().handle;
   uint32_t src_mip = src->mipLevel();
+  // ml2000: cmd.level below is a PHYSICAL Metal level; mipLevel() is LOGICAL.
+  // Render-target-capable surfaces are never clamped (policy excludes
+  // RT/DS/DYNAMIC), but a clamped DEFAULT texture level is a legal argument
+  // here by format/extent, so translate defensively: a clamped-away level has
+  // no GPU texels and fails, anything else shifts down through the bias.
+  {
+    const uint32_t rtd_bias = src->dxmtTexture() ? src->dxmtTexture()->mipBias() : 0;
+    if (src_mip < rtd_bias)
+      return D3DERR_INVALIDCALL;
+    src_mip -= rtd_bias;
+  }
   uint32_t dst_pitch = dst->pitch();
   uint32_t width = sd.Width;
   uint32_t height = sd.Height;
@@ -5443,13 +5623,25 @@ MTLD3D9Device::stretchRectImpl(
       src_swizzle = ssw;
   }
 
-  // Queue the blit(s) into the arrival-order op stream (no per-call flush).
+  // ml2000: PendingBlitOp carries LOGICAL mip indices (UpdateTexture's dst
+  // side translates them through the bias); the encode-thread emitters expect
+  // this and translate to PHYSICAL there. Copy/Stretch/Resolve ops that touch
+  // a level that no longer exists physically have no texels to copy, so fail
+  // them here with INVALIDCALL rather than queueing a blit Metal would Clip.
+  // Clamped textures are DEFAULT-pool sampled BC (never RT/DS/MSAA), so in
+  // practice only the Copy path can see a biased participant.
+  auto d9_blit_bias_drop = [](const Rc<dxmt::Texture> &tex, uint32_t logical) {
+    const uint32_t b = tex ? tex->mipBias() : 0;
+    return b && logical < b;
+  };
   switch (plan.kind) {
   case dxmt::StretchRectKind::Copy: {
     PendingBlitOp op;
     op.kind = PendingBlitOp::Kind::Copy;
     op.src_tex = std::move(src_tex);
     op.dst_tex = std::move(dst_tex);
+    if (d9_blit_bias_drop(op.src_tex, src->mipLevel()) || d9_blit_bias_drop(op.dst_tex, dst->mipLevel()))
+      return D3DERR_INVALIDCALL;
     op.src_mip = src->mipLevel();
     op.dst_mip = dst->mipLevel();
     op.src_slice = src->arraySlice();
@@ -5467,6 +5659,8 @@ MTLD3D9Device::stretchRectImpl(
     op.dst_tex = std::move(dst_tex);
     op.src_mip = src->mipLevel();
     op.dst_mip = dst->mipLevel();
+    if (d9_blit_bias_drop(op.src_tex, src->mipLevel()) || d9_blit_bias_drop(op.dst_tex, dst->mipLevel()))
+      return D3DERR_INVALIDCALL;
     op.src_slice = src->arraySlice();
     op.dst_slice = dst->arraySlice();
     op.src_origin = WMTOrigin{plan.src_x, plan.src_y, 0};
@@ -5487,6 +5681,8 @@ MTLD3D9Device::stretchRectImpl(
     op.dst_tex = std::move(dst_tex);
     op.src_mip = src->mipLevel();
     op.dst_mip = dst->mipLevel();
+    if (d9_blit_bias_drop(op.src_tex, src->mipLevel()) || d9_blit_bias_drop(op.dst_tex, dst->mipLevel()))
+      return D3DERR_INVALIDCALL;
     op.src_slice = src->arraySlice();
     op.dst_slice = dst->arraySlice();
     op.src_origin = WMTOrigin{plan.src_x, plan.src_y, 0};
@@ -5516,6 +5712,10 @@ MTLD3D9Device::stretchRectImpl(
     resolve_op.src_tex = std::move(src_tex);
     resolve_op.dst_tex = transient;
     resolve_op.src_mip = src->mipLevel();
+    // ml2000: MSAA sources are never clamped (compressed textures cannot be
+    // multisampled), but enforce the same invariant as the other legs.
+    if (d9_blit_bias_drop(resolve_op.src_tex, src->mipLevel()))
+      return D3DERR_INVALIDCALL;
     resolve_op.dst_mip = 0;
     resolve_op.src_slice = src->arraySlice();
     resolve_op.dst_slice = 0;
@@ -5531,6 +5731,9 @@ MTLD3D9Device::stretchRectImpl(
     stretch_op.dst_tex = std::move(dst_tex);
     stretch_op.src_mip = 0;
     stretch_op.dst_mip = dst->mipLevel();
+    // ml2000: same guard on the stretch leg's real destination.
+    if (d9_blit_bias_drop(stretch_op.dst_tex, dst->mipLevel()))
+      return D3DERR_INVALIDCALL;
     stretch_op.src_slice = 0;
     stretch_op.dst_slice = dst->arraySlice();
     stretch_op.src_origin = WMTOrigin{0, 0, 0};
@@ -8577,6 +8780,20 @@ EmitDrawCommand_d9(
 
 inline void
 EmitBlitOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBlitOp &op) {
+  // ml2000: PendingBlitOp carries LOGICAL mip indices (widened below at queue
+  // time so UpdateTexture's dst-side skips land correctly); the encode thread
+  // needs PHYSICAL ones. Translate both sides through each texture's bias;
+  // ops touching a level that no longer exists physically have no texels to
+  // copy, so drop them. Matches d3d11's CopySubresourceRegion translation
+  // (d3d11_context_impl.cpp:3938-3972).
+  {
+    const uint32_t src_bias = op.src_tex ? op.src_tex->mipBias() : 0;
+    const uint32_t dst_bias = op.dst_tex ? op.dst_tex->mipBias() : 0;
+    if ((src_bias && op.src_mip < src_bias) || (dst_bias && op.dst_mip < dst_bias))
+      return;
+    op.src_mip -= src_bias;
+    op.dst_mip -= dst_bias;
+  }
   // Register src/dst access for cross-encoder dependency tracking.
   // Without them, same-RT Render-merge folds across blit, executing blit before renders.
   auto src_tex = ctx.access<false>(op.src_tex, op.src_mip, op.src_slice, DXMT_ENCODER_RESOURCE_ACESS_READ);
@@ -8593,7 +8810,6 @@ EmitBlitOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBlitOp &op) {
   cmd.dst_level = op.dst_mip;
   cmd.dst_origin = op.dst_origin;
 }
-
 // Copy a mirror-backed texture level's staged bytes from an upload-ring block
 // into its Private texture. The access<Compute> write registers the destination
 // subresource so the encoder scheduler keeps this upload ahead of any later
@@ -8601,6 +8817,15 @@ EmitBlitOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBlitOp &op) {
 // upload past a same-chunk render pass that reads the level (stale read).
 inline void
 EmitBufferToTextureOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBlitOp &op) {
+  // ml2000: see EmitBlitOp_d9 above; PHYSICAL level for a LOGICAL op.dst_mip.
+  {
+    const uint32_t tex_bias = op.dst_tex ? op.dst_tex->mipBias() : 0;
+    if (tex_bias) {
+      if (op.dst_mip < tex_bias)
+        return;
+      op.dst_mip -= tex_bias;
+    }
+  }
   auto dst_tex = ctx.access<false>(op.dst_tex, op.dst_mip, op.dst_slice, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
   auto &cmd = ctx.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
   cmd.type = WMTBlitCommandCopyFromBufferToTexture;
@@ -8640,9 +8865,18 @@ EmitGenerateMipmapsOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBli
 // ctx.stretchBlit opens its own encoder; TextureViewKey selects mip level.
 inline void
 EmitStretchBlitOp_d9(StretchBlitContext &stretch_cmd, MTLD3D9Device::PendingBlitOp &op) {
-  // The source stays 2D: fs_blit_quad samples it, and Metal has no sampler for
-  // a multisampled texture, so the planner never routes a multisampled source
-  // here (it resolves first).
+  // ml2000: firstMiplevel is a PHYSICAL Metal level; see EmitBlitOp_d9 above.
+  // Stretch sources that are clamped away never legitimately arrive here (a
+  // clamped BC texture is DEFAULT-pool and can only be the copy source for a
+  // same-format Copy; RT/DS are never clamped), so treat them as a no-op.
+  {
+    const uint32_t src_bias = op.src_tex ? op.src_tex->mipBias() : 0;
+    const uint32_t dst_bias = op.dst_tex ? op.dst_tex->mipBias() : 0;
+    if ((src_bias && op.src_mip < src_bias) || (dst_bias && op.dst_mip < dst_bias))
+      return;
+    op.src_mip -= src_bias;
+    op.dst_mip -= dst_bias;
+  }
   TextureViewKey src_view = op.src_tex->createView({
       .format = op.src_tex->pixelFormat(),
       .type = WMTTextureType2D,
@@ -8682,9 +8916,17 @@ EmitStretchBlitOp_d9(StretchBlitContext &stretch_cmd, MTLD3D9Device::PendingBlit
 // must end any open pass first.
 inline void
 EmitResolveBlitOp_d9(ResolveTextureContext &resolve_cmd, MTLD3D9Device::PendingBlitOp &op) {
-  // Both sides are fixed here by what the resolve does rather than by the
-  // textures: Resolve is only planned for a multisampled source, and it renders
-  // the averaged samples into a single-sample destination.
+  // ml2000: firstMiplevel is a PHYSICAL Metal level; see EmitStretchBlitOp_d9
+  // above. MSAA sources/destinations are never clamped (compressed textures
+  // cannot be multisampled), so this only ever sees bias 0; kept for symmetry.
+  {
+    const uint32_t src_bias = op.src_tex ? op.src_tex->mipBias() : 0;
+    const uint32_t dst_bias = op.dst_tex ? op.dst_tex->mipBias() : 0;
+    if ((src_bias && op.src_mip < src_bias) || (dst_bias && op.dst_mip < dst_bias))
+      return;
+    op.src_mip -= src_bias;
+    op.dst_mip -= dst_bias;
+  }
   TextureViewKey src_view = op.src_tex->createView({
       .format = op.src_tex->pixelFormat(),
       .type = WMTTextureType2DMultisample,
@@ -8749,11 +8991,18 @@ deriveSampleView(const Rc<dxmt::Texture> &rc, MTLD3D9CommonTexture *tex, const D
   }
   // D3D9 SetLOD(N) clamps sampling to mips N..(level_count-1). lod 0 (apps that
   // never call SetLOD) leaves the full mip range.
+  // ml2000 (D3D9 BC mip clamp): the fullView's mip range is PHYSICAL while the
+  // app's SetLOD(N) is LOGICAL, mirroring d3d11's MostDetailedMip rebase
+  // (d3d11_texture_device.cpp:294-310). Logical mip N is physical mip N-bias,
+  // so the requested floor rebases down by the bias; a floor at or above the
+  // bias no longer exists physically and resolves to physical level 0.
   uint32_t lod = tex->commonTextureLod();
   if (lod > 0) {
-    uint32_t total = rc->miplevelCount();
-    if (lod < total)
-      view = rc->checkViewUseMipRange(view, lod, total - lod);
+    const uint32_t lod_bias = tex->dxmtTexture() ? tex->dxmtTexture()->mipBias() : 0;
+    const uint32_t lod_phys = lod > lod_bias ? lod - lod_bias : 0;
+    const uint32_t total = rc->miplevelCount();
+    if (lod_phys < total)
+      view = rc->checkViewUseMipRange(view, lod_phys, total - lod_phys);
   }
   return view;
 }

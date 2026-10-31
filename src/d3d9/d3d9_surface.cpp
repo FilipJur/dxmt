@@ -733,10 +733,16 @@ MTLD3D9Surface::UnlockRect() {
     // The locked region owns only its own row length inside the mirror, not
     // the whole stride: a rect flush against the bottom edge with a non-zero
     // left edge has nothing after its last row (see stageTextureUpload).
-    m_device->stageTextureUpload(
-        m_texture, m_dxmtTexture, m_mip_level, m_array_slice, origin, size, src, m_pitch, compressed,
-        /*src_slice_pitch=*/0, D3DFormatRowPitch(m_desc.Format, m_locked_w)
-    );
+    // ml2000: a clamped-away level has no physical storage, so there is nothing
+    // to stage (stageTextureUpload drops it too); the bytes stay in the logical
+    // mirror. Dirty-region and autogen bookkeeping below stay logical.
+    const uint32_t unlock_bias = m_dxmtTexture ? m_dxmtTexture->mipBias() : 0;
+    if (m_mip_level >= unlock_bias) {
+      m_device->stageTextureUpload(
+          m_texture, m_dxmtTexture, m_mip_level, m_array_slice, origin, size, src, m_pitch, compressed,
+          /*src_slice_pitch=*/0, D3DFormatRowPitch(m_desc.Format, m_locked_w)
+      );
+    }
     // The bytes are now snapshotted into the upload ring; the mirror is no
     // longer referenced. A MANAGED parent reclaims it once every level has
     // been uploaded (the level surfaces' cpu_ptr is nulled, so a later Lock

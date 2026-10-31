@@ -168,6 +168,19 @@ public:
   levelCount() const {
     return static_cast<UINT>(m_levels.size());
   }
+  // ml2000 (D3D9 BC mip clamp): top mip levels missing from the PHYSICAL Metal
+  // texture, mirroring d3d11 DeviceTexture::mip_bias_. The D3D descriptor stays
+  // LOGICAL; uploads and Metal indices translate through dxmt::Texture::mipBias
+  // (set in sync at CreateTexture). Read here by calling-thread code
+  // (UpdateTexture dst-side skips, sample-view LOD rebase).
+  uint32_t
+  mipBias() const {
+    return m_mipBias;
+  }
+  void
+  setMipBias(uint32_t bias) {
+    m_mipBias = bias;
+  }
   // Per-texture dirty-region tracking: wined3d
   // wined3d_texture_add_dirty_region records a single union region at
   // level-0 coordinates for the whole sub-resource set, then scales it
@@ -308,6 +321,10 @@ private:
   // m_levels[i] would be only other source (surfaces have no width accessor).
   UINT m_width = 0;
   UINT m_height = 0;
+  // ml2000: see the mipBias()/setMipBias() comment above. Always in sync with
+  // m_dxmtTexture->mipBias(); the D3D-visible level count, surfaces and mirror
+  // stay logical regardless.
+  uint32_t m_mipBias = 0;
   DWORD m_priority = 0;
   // Atomic: the encode-thread draw walker reads the LOD clamp (commonTextureLod)
   // without the device lock while a calling-thread SetLOD may write it. Relaxed
