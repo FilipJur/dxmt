@@ -118,8 +118,8 @@ read_mode(void)
     if (len == 0 || len >= sizeof(value)) {
         shim_mode = D3D9SHIM_MODE_DEFAULT;
         d3d9shim_trace("[d3d9] MADEIRA_D3D9 unset: forwarding to "
-                       "d3d9-emulated.dll (Documents/madeira-d3d9.txt = "
-                       "native selects the native ARM64 frontend)");
+                       "d3d9-emulated.dll (d3d9 = native in madeira.cfg "
+                       "selects the native ARM64 frontend)");
         return;
     }
     if (!_stricmp(value, "emulated") || !_stricmp(value, "pe")
