@@ -44,6 +44,18 @@ public:
    */
   uint64_t flushToWait();
 
+  /* MADEIRA (P4 T5, mem-graphics.md section 7(b)(2)): release the upload heap's
+   * retained blocks.
+   *
+   * RingBumpState keeps a block until 300 later submissions have expired it, so
+   * a load-time upload burst pins every block it touched long after the copy
+   * landed -- the measured init-upload peak is 354 MB. When the upload queue has
+   * retired all submitted work and no blit/clear is queued, nothing can still
+   * name a block, so this drops all of them; otherwise it drops only the blocks
+   * free_blocks() already considers expired, so a pending upload never loses
+   * its backing. Returns the coherent sequence id the release was made at. */
+  uint64_t releaseSpareHeap();
+
   void
   wait(uint64_t seq_id, uint64_t timeout = -1) {
     if (cached_coherent_seq_id >= seq_id)

@@ -1,5 +1,6 @@
 #include "dxmt_buffer.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_staging.hpp"   /* MADEIRA (P4 T5): MadeiraRelieveTransientPools */
 #include "thread.hpp"
 #include "util_likely.hpp"
 #include "util_math.hpp"
@@ -147,6 +148,11 @@ Buffer::createView(BufferViewDescriptor const &descriptor) {
 
 Rc<BufferAllocation>
 Buffer::allocate(Flags<BufferAllocationFlag> flags, const char *site) {
+  /* MADEIRA (P4 T5, mem-graphics.md section 7(b)(2)): the second choke point.
+   * Every buffer allocation lands here -- vertex/index/constant buffers, dynamic
+   * renames, staging pools, the initializer's uploads -- so relief is triggered
+   * from the allocation that is actually about to grow the footprint. */
+  MadeiraRelieveTransientPools("Buffer::allocate");
   WMTResourceOptions options = WMTResourceStorageModeShared;
   if (flags.test(BufferAllocationFlag::GpuReadonly)) {
     options |= WMTResourceHazardTrackingModeUntracked;

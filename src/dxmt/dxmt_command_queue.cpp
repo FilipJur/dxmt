@@ -7,10 +7,31 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <mutex>
+#include <vector>
 
 #define ASYNC_ENCODING 1
 
 namespace dxmt {
+
+/* MADEIRA (P4 T5, mem-graphics.md section 7(b)(2)): the queue's three ring
+ * allocators, so the relief pass can expire their blocks without a CommandQueue
+ * reference (the choke points live in the allocation layer, which has none).
+ * The pointers are taken in the constructor and dropped at the top of the
+ * destructor, both as member functions -- that is what makes the private
+ * members reachable -- and the registry lock is held across a whole pass, so an
+ * unregistration cannot land between the walk and the release. */
+namespace {
+struct QueueTransientPools {
+  CommandQueue *queue;
+  RingBumpState<StagingBufferBlockAllocator> *staging;
+  RingBumpState<GpuPrivateBufferBlockAllocator> *copy_temp;
+  RingBumpState<StagingBufferBlockAllocator, kCommandChunkGPUHeapSize> *argbuf;
+  ResourceInitializer *initializer;
+};
+std::mutex g_queue_pools_mutex;
+std::vector<QueueTransientPools> g_queue_pools;
+} // namespace
 
 void *
 CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
@@ -45,6 +66,11 @@ CommandQueue::CommandQueue(WMT::Device device) :
   };
   event = device.newSharedEvent();
 
+  {
+    std::lock_guard<std::mutex> lock(g_queue_pools_mutex);
+    g_queue_pools.push_back({this, &staging_allocator, &copy_temp_allocator, &argbuf_allocator, &initializer});
+  }
+
   std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
 
   if (!env.empty()) {
@@ -57,6 +83,15 @@ CommandQueue::CommandQueue(WMT::Device device) :
 
 CommandQueue::~CommandQueue() {
   TRACE("Destructing command queue");
+  {
+    std::lock_guard<std::mutex> lock(g_queue_pools_mutex);
+    auto &list = g_queue_pools;
+    for (auto it = list.begin(); it != list.end(); ++it)
+      if (it->queue == this) {
+        list.erase(it);
+        break;
+      }
+  }
   stopped.store(true);
   ready_for_encode++;
   dxmt::atomic_notify_one(ready_for_encode);
@@ -306,6 +341,52 @@ CommandQueue::WaitCPUFenceBounded(uint64_t seq, uint64_t timeout_ns) {
 void
 CommandQueue::MarkDeviceError() {
   device_error_.store(true, std::memory_order_release);
+}
+
+/* ---------------------------------------------------------------------------
+ * MADEIRA (P4 T5): the relief pass's entry points into this queue; declared in
+ * dxmt_staging.cpp beside the rest of the pass. Both report what they released
+ * so the pass can print one line per reclaim.
+ * ------------------------------------------------------------------------- */
+
+size_t
+ReleaseCommandQueueRingSpares(uint64_t *out_coherent_seq) {
+  std::lock_guard<std::mutex> lock(g_queue_pools_mutex);
+  if (out_coherent_seq)
+    *out_coherent_seq = 0;
+  /* The live completion watermark, handed back so the staging and dynamic-buffer
+   * trims can test their fifos against a CURRENT value: an instance's own
+   * last-seen id is stale for exactly the pool worth trimming (one that stopped
+   * being used after a burst). Only answered when there is exactly one queue --
+   * with several, a will_free_at value belongs to a domain this cannot identify,
+   * and the pass falls back to each instance's own value instead. */
+  if (g_queue_pools.size() == 1 && out_coherent_seq)
+    *out_coherent_seq = g_queue_pools.front().queue->CoherentSeqId();
+  const uint64_t before = g_mem_census.live[MEMOWN_STAGING_RING].load(std::memory_order_relaxed);
+  for (auto &p : g_queue_pools) {
+    /* The same release the finish thread performs, with the same sequence id:
+     * blocks whose 300-submission lifetime has expired go now, instead of
+     * whenever the next completion happens to notice. Deliberately NOT a forced
+     * release of every block -- allocate() hands out a suballocation into the
+     * newest block's mapped memory on the API thread, and freeing a block that
+     * a concurrent encode is writing into is a use-after-free. */
+    const uint64_t coherent = p.queue->CoherentSeqId();
+    p.staging->free_blocks(coherent);
+    p.copy_temp->free_blocks(coherent);
+    p.argbuf->free_blocks(coherent);
+  }
+  const uint64_t after = g_mem_census.live[MEMOWN_STAGING_RING].load(std::memory_order_relaxed);
+  return before > after ? (size_t)(before - after) : 0;
+}
+
+size_t
+TrimInitializerHeapSpares() {
+  std::lock_guard<std::mutex> lock(g_queue_pools_mutex);
+  const uint64_t before = g_mem_census.live[MEMOWN_INIT_UPLOAD].load(std::memory_order_relaxed);
+  for (auto &p : g_queue_pools)
+    p.initializer->releaseSpareHeap();
+  const uint64_t after = g_mem_census.live[MEMOWN_INIT_UPLOAD].load(std::memory_order_relaxed);
+  return before > after ? (size_t)(before - after) : 0;
 }
 
 } // namespace dxmt

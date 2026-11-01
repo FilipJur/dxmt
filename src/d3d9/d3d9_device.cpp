@@ -903,6 +903,41 @@ MTLD3D9Device::releaseBufferBacking(
   // Device teardown: member destruction order can run this after the pool
   // vector is gone; free directly (the GPU was quiesced at dtor entry).
   std::lock_guard<dxmt::mutex> lock(m_bufferBackingPoolMutex);
+  /* MADEIRA (P4 T5, mem-graphics.md section 7(b)(2)): under memory pressure the
+   * pool is the wrong place for a donation, and the entries already in it are
+   * the same cache. Drain both instead of pooling.
+   *
+   * Nothing in flight can be reading these pages: the precondition above is that
+   * a donation is GPU-idle, and every pooled entry was donated under it. The cap
+   * this bypasses is 64 MB / 128 entries (d3d9_device.hpp:1525,1529), which is
+   * exactly the footprint a process near jetsam cannot park. */
+  {
+    extern bool MadeiraD9MemoryPressure();
+    if (!m_tearingDown && MadeiraD9MemoryPressure()) {
+      const size_t pooled_entries = m_bufferBackingPool.size();
+      const size_t pooled_bytes = m_bufferBackingPoolBytes;
+      size_t dropped = 0;
+      for (auto &entry : m_bufferBackingPool) {
+        entry.buffer = WMT::Reference<WMT::Buffer>{};
+        if (entry.owned_backing) {
+          guest_free(entry.owned_backing);
+          dropped += entry.capacity;
+        }
+      }
+      m_bufferBackingPool.clear();
+      m_bufferBackingPoolBytes = 0;
+      buffer = WMT::Reference<WMT::Buffer>{};
+      if (owned)
+        guest_free(owned);
+      dropped += capacity;
+      if (pooled_entries)
+        Logger::warn(str::format(
+            "[relief] mlP4 d3d9 buffer-backing pool drained: entries=", pooled_entries, " pooled=",
+            pooled_bytes >> 10, " KiB freed=", dropped >> 10, " KiB (memory pressure)"
+        ));
+      return;
+    }
+  }
   if (m_tearingDown || m_bufferBackingPool.size() >= kMaxBufferBackingPoolSize ||
       m_bufferBackingPoolBytes + capacity > kMaxBufferBackingPoolBytes) {
     // Pool full (by count or by bytes): drop on the floor. The moved-in

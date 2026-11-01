@@ -671,6 +671,23 @@ ResourceInitializer::flushToWait() {
   return flushInternal();
 }
 
+uint64_t
+ResourceInitializer::releaseSpareHeap() {
+  std::lock_guard<dxmt::mutex> lock(mutex_);
+  const uint64_t signaled = upload_queue_event_.signaledValue();
+  if (signaled > cached_coherent_seq_id)
+    cached_coherent_seq_id = signaled;
+  /* Force every retained block out only when nothing can still name one: no
+   * queued blit or clear, and the upload queue has retired every submission.
+   * Otherwise take only what free_blocks() already calls expired, which is the
+   * release the next flushToWait would do anyway. */
+  if (idle() && cached_coherent_seq_id == current_seq_id_ - 1)
+    gpu_command_heap_allocator.free_blocks(~0ull);
+  else
+    gpu_command_heap_allocator.free_blocks(cached_coherent_seq_id);
+  return cached_coherent_seq_id;
+}
+
 void
 ResourceInitializer::reset() {
   cpu_command_heap_offset = 0;

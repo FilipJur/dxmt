@@ -312,13 +312,20 @@ static constexpr uint32_t kMirrorReadEvictThreshold = 4;
 // drains the GPU queue. Keep a bounded working set without changing LockRect
 // visibility or discarding the CPU's authoritative bytes. Shared across devices
 // in this module; destructors may run on the encode thread.
+//
+// MADEIRA (P4 T5, mem-graphics.md section 7(b)(3)): 32 MB -> 8 MB. The budget
+// is a cache, not a requirement: a re-download costs one queue drain, while the
+// bytes are resident for the whole session and are exactly the kind of memory a
+// process near jetsam cannot afford to hold for a read-back that may never come.
+// Paired with the pressure-gated eviction in evictManagedMirror(), which
+// releases live mirrors instead of pinning them when headroom is low.
 static std::atomic<size_t> retainedMirrorBytes{0};
-static constexpr size_t kMirrorRetentionBudget = 32u * 1024u * 1024u;
+static constexpr size_t kMirrorRetentionBudget = 8u * 1024u * 1024u;
 static bool smallMirrorRetentionEnabled() {
   static const bool enabled = [] {
     const bool value = env::getEnvVar("DXMT_D9_SMALL_MIRROR_CACHE") != "0";
     Logger::warn(str::format("[mirror-cache] ml1180 enabled=", value,
-        " budget=33554432 max-resource=262144"));
+        " budget=8388608 max-resource=262144"));
     return value;
   }();
   return enabled;
@@ -339,6 +346,29 @@ static bool smallMirrorRetentionEnabled() {
 static bool
 mirrorIsSoleCopy(MTLD3D9Device *device, D3DFORMAT format) {
   return !device->bcTexturesSupported() && (IsCompressedFormat(format) || Is3DcFormat(format));
+}
+
+// MADEIRA (P4 T5, mem-graphics.md section 7(b)(3)): is this process close to
+// its jetsam line? MadeiraCtl op 7 answers with the live numbers (len =
+// os_proc_available_memory, ptr = phys_footprint); the DXGI/D3D9 budget queries
+// are answered once per run and would make this dead code.
+//
+// Shared with d3d9_device.cpp (releaseBufferBacking, which drains the backing
+// pool under the same predicate) -- it declares this at its call site because
+// neither file may grow a header entry in this wave. Refreshed every 32 calls:
+// the mirror paths run on create/evict/destroy, not per draw.
+bool
+MadeiraD9MemoryPressure() {
+  static std::atomic<uint32_t> calls{0};
+  static std::atomic<bool> cached{false};
+  if (calls.fetch_add(1, std::memory_order_relaxed) & 31)
+    return cached.load(std::memory_order_relaxed);
+  struct madeira_ctl_args args = {};
+  args.op = 7;
+  MadeiraCtl(&args);
+  const bool pressure = args.ret == 1 && (args.len >> 20) < 1024ull;
+  cached.store(pressure, std::memory_order_relaxed);
+  return pressure;
 }
 
 void
@@ -625,6 +655,34 @@ MTLD3D9Texture::evictManagedMirror() {
   // authoritative, so there is nothing to re-push.
   if (m_pool != D3DPOOL_MANAGED || m_mirrorBacking == nullptr)
     return;
+  /* MADEIRA (P4 T5, mem-graphics.md section 7(b)(3)): under memory pressure the
+   * observable reload and the memory release are the same operation. When every
+   * level has been uploaded, the Metal texture is authoritative, so the mirror is
+   * pure cache: release it through dropMirror (which hands the backing to the
+   * device pool, where releaseBufferBacking frees it instead of pooling while the
+   * pressure lasts). The next Lock re-materialises it from the GPU, which is what
+   * "reload from the master on next use" means on a unified-memory device.
+   *
+   * The mask check is the precondition for dropping at all: a level whose bytes
+   * were never pushed lives ONLY in the mirror, and releasing it there would
+   * silently lose the app's data. m_needs_upload_mask covers the other half of
+   * that: a NO_DIRTY_UPDATE write (ml1110) leaves the level's bytes in the
+   * mirror with the GPU copy stale, and m_uploaded_mask still reads complete
+   * from the earlier upload, so both masks must be clean. */
+  if (m_uploaded_mask == m_all_levels_mask && m_needs_upload_mask == 0 && MadeiraD9MemoryPressure()) {
+    const size_t mirror_bytes = m_mirrorOffsets.empty() ? 0u : m_mirrorOffsets.back();
+    dropMirror();
+    if (m_mirrorBacking == nullptr) {
+      /* Proof line for the reclaim: first 8, then every 64th release. */
+      static std::atomic<uint32_t> released{0};
+      const uint32_t n = released.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n & 63) == 0)
+        Logger::warn(str::format(
+            "[relief] mlP4 managed mirror evicted under pressure: #", n, " ", mirror_bytes >> 10, " KiB"
+        ));
+      return;   /* released: the mirror is gone, nothing left to re-arm */
+    }
+  }
   m_needs_upload_mask |= m_all_levels_mask;
 }
 

@@ -5,9 +5,19 @@
 #include "log/log.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace dxmt {
+
+/* MADEIRA (P4 T5): every live DynamicBuffer, so the relief pass can trim each
+ * one's eligible retired names. Guarded, and only the last reference removes the
+ * entry (in decRef, before the delete), so a walk cannot outlive an instance. */
+namespace {
+std::mutex g_dyn_registry_mutex;
+std::vector<DynamicBuffer *> g_dyn_registry;
+} // namespace
 
 /* DXMT_DYN_KEEP = <entries>, default unset/0 = off.
  *
@@ -57,6 +67,10 @@ DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags) 
   census_id_ = g_dyn_next_id.fetch_add(1, std::memory_order_relaxed);
   if (census_id_ < DYN_CENSUS_SLOTS)
     g_dyn_stats[census_id_].length.store(buffer ? buffer->length() : 0, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(g_dyn_registry_mutex);
+    g_dyn_registry.push_back(this);
+  }
 }
 
 void
@@ -67,6 +81,15 @@ DynamicBuffer::incRef() {
 void
 DynamicBuffer::decRef() {
   if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u) {
+    {
+      std::lock_guard<std::mutex> lock(g_dyn_registry_mutex);
+      auto &list = g_dyn_registry;
+      for (auto it = list.begin(); it != list.end(); ++it)
+        if (*it == this) {
+          list.erase(it);
+          break;
+        }
+    }
     g_live_dynbuf.destroyed.fetch_add(1, std::memory_order_relaxed);   /* ml684 */
     delete this;
   }
@@ -75,6 +98,8 @@ DynamicBuffer::decRef() {
 Rc<BufferAllocation>
 DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
   std::lock_guard<dxmt::mutex> lock(mutex_);
+  if (coherent_seq_id > last_coherent_seq_)
+    last_coherent_seq_ = coherent_seq_id;
   /* ml685 TRIM REGRET: did we release something and then immediately have to
    * allocate again? That -- not the raw churn count -- is what says the 64-entry
    * reserve is too tight. Cleared every call, set only by an actual trim. */
@@ -229,6 +254,10 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
 void
 DynamicBuffer::updateImmediateName(uint64_t current_seq_id, Rc<BufferAllocation> &&allocation, uint32_t suballocation, bool owned_by_command_list) {
   std::lock_guard<dxmt::mutex> lock(mutex_);
+  /* current_seq_id is the RECORDING seq (CommandQueue::CurrentSeqId()), ahead of
+   * completion, so it must not widen the watermark trimEligible() tests fifo
+   * entries against -- that would release a buffer a submitted-but-unretired
+   * chunk may still read. Only allocate()'s coherent parameter is recorded. */
   g_mem_census.dyn_seq_current.store(current_seq_id, std::memory_order_relaxed);   /* ml680 */
   if (!owned_by_command_list_ && census_id_ < DYN_CENSUS_SLOTS)
     g_dyn_stats[census_id_].push_update.fetch_add(1, std::memory_order_relaxed);   /* ml681 */
@@ -242,6 +271,7 @@ DynamicBuffer::updateImmediateName(uint64_t current_seq_id, Rc<BufferAllocation>
 void
 DynamicBuffer::recycle(uint64_t current_seq_id, Rc<BufferAllocation> &&allocation) {
   std::lock_guard<dxmt::mutex> lock(mutex_);
+  /* Recording seq, not a completion watermark: see updateImmediateName. */
   if (owned_by_command_list_) {
     if (name_.ptr() == allocation.ptr()) {
       owned_by_command_list_ = false;
@@ -252,6 +282,71 @@ DynamicBuffer::recycle(uint64_t current_seq_id, Rc<BufferAllocation> &&allocatio
   if (census_id_ < DYN_CENSUS_SLOTS)
     g_dyn_stats[census_id_].push_recycle.fetch_add(1, std::memory_order_relaxed);   /* ml681 */
   fifo.push_back(QueueEntry{.allocation = std::move(allocation), .will_free_at = current_seq_id});
+}
+
+size_t
+DynamicBuffer::trimEligible(uint64_t coherent_hint) {
+  /* try_lock: the relief pass is reached from Buffer::allocate, and this very
+   * instance calls Buffer::allocate from inside allocate() with its own lock
+   * held -- locking again here would deadlock the same thread. A busy instance
+   * simply keeps its cache for this pass. */
+  std::unique_lock<dxmt::mutex> lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock())
+    return 0;
+  const uint64_t coherent_seq_id = std::max(coherent_hint, last_coherent_seq_);
+  if (!coherent_seq_id || fifo.empty())
+    return 0;
+  /* Same rule as the allocate-time trim (ml681): entries are pushed in
+   * non-decreasing will_free_at order, so the GPU-complete ones are the front
+   * run and stopping at the first fenced entry is what keeps this safe. The only
+   * difference is the reserve -- 8 names instead of 64, because this runs when
+   * the process is close to its limit. */
+  uint64_t eligible = 0;
+  for (const auto &e : fifo) {
+    if (e.will_free_at > coherent_seq_id)
+      break;
+    eligible++;
+  }
+  if (eligible <= (uint64_t)kTrimReserveEligible)
+    return 0;
+  uint64_t drop = eligible - (uint64_t)kTrimReserveEligible, freed = 0, freed_n = 0;
+  while (drop && !fifo.empty()) {
+    const QueueEntry &front = fifo.front();
+    if (front.will_free_at > coherent_seq_id)   /* never touch fenced */
+      break;
+    freed += front.allocation.ptr() ? front.allocation->census_bytes_ : 0;
+    fifo.pop_front();
+    freed_n++;
+    drop--;
+  }
+  if (!freed_n)
+    return 0;
+  trimmed_last_ = true;                        /* ml685: for trim-regret */
+  g_trim_total_n.fetch_add(freed_n, std::memory_order_relaxed);
+  g_trim_total_bytes.fetch_add(freed, std::memory_order_relaxed);
+  if (census_id_ < DYN_CENSUS_SLOTS) {
+    DynStat &st = g_dyn_stats[census_id_];
+    st.trimmed_n.fetch_add(freed_n, std::memory_order_relaxed);
+    st.trimmed_bytes.fetch_add(freed, std::memory_order_relaxed);
+    st.depth.store(fifo.size(), std::memory_order_relaxed);
+  }
+  return (size_t)freed;
+}
+
+size_t
+DynamicBuffer::trimAllEligible(uint64_t coherent_seq_id) {
+  std::lock_guard<std::mutex> lock(g_dyn_registry_mutex);
+  size_t freed = 0;
+  for (auto *instance : g_dyn_registry)
+    freed += instance->trimEligible(coherent_seq_id);
+  return freed;
+}
+
+/* MADEIRA (P4 T5): the relief pass's entry point into the DynamicBuffer pool;
+ * declared in dxmt_staging.cpp beside the rest of the pass. */
+size_t
+TrimDynamicBufferSpares(uint64_t coherent_seq_id) {
+  return DynamicBuffer::trimAllEligible(coherent_seq_id);
 }
 
 uint32_t

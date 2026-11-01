@@ -23,6 +23,29 @@ public:
   void recycle(uint64_t current_seq_id, Rc<BufferAllocation> &&allocation);
   uint32_t nextSuballocation();
 
+  /* MADEIRA (P4 T5, mem-graphics.md section 7(b)(2)): release the retired names
+   * the GPU has finished with, down to kTrimReserveEligible instead of the
+   * allocate-time working reserve.
+   *
+   * allocate() only trims when it is about to mint a replacement, so a fifo
+   * that stops being asked for anything keeps its eligible entries for the life
+   * of the instance. Under memory pressure those entries are cache, and this is
+   * the trim the census already counts (g_trim_total_n/g_trim_total_bytes).
+   * Trims against THIS instance's newest coherent sequence id: will_free_at
+   * values only mean anything inside the queue that produced them, so a
+   * foreign (possibly larger) id could drop an entry still in GPU use.
+   * coherent_seq_id is the caller's live watermark for that same queue (0 when
+   * it cannot identify one); the larger of it and the instance's own last-seen
+   * value is used, because a fifo that stopped being asked for anything would
+   * otherwise keep an eligible tail nobody ever marks as complete.
+   * Returns the bytes released. */
+  size_t trimEligible(uint64_t coherent_seq_id);
+
+  enum { kTrimReserveEligible = 8 };
+
+  /* Cross-instance entry point for the relief pass. */
+  static size_t trimAllEligible(uint64_t coherent_seq_id);
+
   Rc<BufferAllocation>
   immediateName() {
     return name_;
@@ -66,6 +89,9 @@ private:
   uint32_t name_suballocation_ = 0;
   bool owned_by_command_list_ = false;
   bool trimmed_last_ = false;      /* ml685: trim-regret latch */
+  /* MADEIRA (P4 T5): newest coherent sequence id seen by THIS instance, the
+   * only domain its fifo's will_free_at values belong to (see trimEligible). */
+  uint64_t last_coherent_seq_ = 0;
 };
 
 class DynamicLinearTexture {

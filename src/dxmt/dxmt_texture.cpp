@@ -1,5 +1,6 @@
 #include "dxmt_texture.hpp"
 #include "dxmt_residency.hpp"
+#include "dxmt_staging.hpp"   /* MADEIRA (P4 T5): MadeiraRelieveTransientPools */
 #include "wsi_platform.hpp"
 #include <atomic>
 #include <cassert>
@@ -162,6 +163,13 @@ Texture::Texture(
 
 Rc<TextureAllocation>
 Texture::allocate(Flags<TextureAllocationFlag> flags) {
+  /* MADEIRA (P4 T5, mem-graphics.md section 7(b)(2)): the choke point. Every
+   * texture allocation passes here -- D3D9 and D3D11, creation and streaming
+   * renames -- so a process that is close to jetsam gets its transient caches
+   * (staging spares, queue rings, upload heap, dynamic-buffer fifos) released
+   * before this allocation asks for its own bytes. Rate-limited and
+   * footprint-keyed inside; a non-pressure run costs one relaxed increment. */
+  MadeiraRelieveTransientPools("Texture::allocate");
   WMTResourceOptions options = WMTResourceStorageModeShared;
   WMTTextureInfo info = info_; // copy
   info.mach_port = 0;
