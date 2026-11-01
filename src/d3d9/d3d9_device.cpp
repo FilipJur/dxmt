@@ -1879,6 +1879,11 @@ MTLD3D9Device::readbackSurfaceMirrors(MTLD3D9Surface *const *surfaces, size_t co
     // copied back into compressed blocks without a re-encoder.
     if (!m_bcSupported && (IsCompressedFormat(desc.Format) || Is3DcFormat(desc.Format)))
       continue;
+    // ml2000: a clamped-away level has no GPU texels to read back; its mirror
+    // stays authoritative. Skipping it here also keeps the memcpy in drain()
+    // from overwriting the mirror with ring bytes no blit filled.
+    if (surface->dxmtTexture() && surface->mipLevel() < surface->dxmtTexture()->mipBias())
+      continue;
     const uint32_t pitch = Is3DcFormat(desc.Format)
         ? D3DFormatMetalTransferPitch(desc.Format, desc.Width) : surface->pitch();
     const uint32_t rows = D3DFormatMetalTransferRows(desc.Format, desc.Height);
@@ -4516,13 +4521,10 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
     dst->ensureMirror();
     uint8_t *dst_mirror = static_cast<uint8_t *>(dst->mirrorBase());
     // ml2000: the destination may be clamped (SYSTEMMEM sources never are:
-    // clamp policy is DEFAULT-pool only). A clamped-away dst level has no
-    // physical storage; skip it and keep its logical mirror copy below (the
-    // mirror is logical-sized, stageTextureUpload drops it too).
-    const uint32_t ut_dst_bias = dst->mipBias();
+    // clamp policy is DEFAULT-pool only). stageTextureUpload drops the GPU
+    // upload for a clamped-away dst level (no physical storage); the logical
+    // mirror copy below still runs so a later Lock sees the new bytes.
     for (UINT dst_level = 0; dst_level < levels_to_copy; ++dst_level) {
-      if (dst_level < ut_dst_bias)
-        continue;
       const UINT src_level = src_level_offset + dst_level;
       D3DSURFACE_DESC d{};
       if (FAILED(src->GetLevelDesc(src_level, &d)))
@@ -8901,9 +8903,8 @@ EmitGenerateMipmapsOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBli
 inline void
 EmitStretchBlitOp_d9(StretchBlitContext &stretch_cmd, MTLD3D9Device::PendingBlitOp &op) {
   // ml2000: firstMiplevel is a PHYSICAL Metal level; see EmitBlitOp_d9 above.
-  // Stretch sources that are clamped away never legitimately arrive here (a
-  // clamped BC texture is DEFAULT-pool and can only be the copy source for a
-  // same-format Copy; RT/DS are never clamped), so treat them as a no-op.
+  // A clamped-away level has no physical storage, so a stretch from or to one
+  // is a no-op (the caller skips its retile for the same reason).
   {
     const uint32_t src_bias = op.src_tex ? op.src_tex->mipBias() : 0;
     const uint32_t dst_bias = op.dst_tex ? op.dst_tex->mipBias() : 0;
@@ -11279,7 +11280,13 @@ MTLD3D9Device::FlushDrawBatch() {
           // GPU access first so a source last written by a blit/fill is not read
           // through a stale GPU-compressed layout (Metal3 backend only; the
           // StretchBlit encoder is compiled out under Metal4).
-          ctx.optimizeTextureForGPUAccess(op.src_tex, op.src_mip, op.src_slice);
+          // ml2000: optimize takes a PHYSICAL level; a clamped-away source is a
+          // no-op in EmitStretchBlitOp_d9, so skip its retile too.
+          {
+            const uint32_t src_bias = op.src_tex ? op.src_tex->mipBias() : 0;
+            if (op.src_mip >= src_bias)
+              ctx.optimizeTextureForGPUAccess(op.src_tex, op.src_mip - src_bias, op.src_slice);
+          }
           EmitStretchBlitOp_d9(ctx.stretch_blit_cmd, op);
           break;
         case MTLD3D9Device::PendingBlitOp::Kind::Resolve:
