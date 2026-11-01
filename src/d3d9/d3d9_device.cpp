@@ -104,6 +104,7 @@ GetD3D9MipClampAutoConfig() {
   static const D3D9MipClampAutoConfig cfg = [] {
     D3D9MipClampAutoConfig c;
     const std::string opt = Config::getInstance().getOption<std::string>("d3d9.mipClampAuto", "");
+    // Drops the top mip of large D3D9 BC textures near the memory limit: 0 off, 1 on (default on in 32-bit games).
     const std::string env_v = env::getEnvVar("MADEIRA_D3D9_MIP_CLAMP_AUTO");
     if (mip_clamp::IsOffValue(opt.c_str()) || mip_clamp::IsOffValue(env_v.c_str()))
       c.enabled = false;

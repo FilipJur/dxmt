@@ -308,17 +308,17 @@ MTLD3D9Texture::ensureMirror() {
 // wins arrives much sooner.
 static constexpr uint32_t kMirrorReadEvictThreshold = 4;
 
-// Small MANAGED mirrors are inexpensive, but reconstructing even a tiny one
-// drains the GPU queue. Keep a bounded working set without changing LockRect
-// visibility or discarding the CPU's authoritative bytes. Shared across devices
-// in this module; destructors may run on the encode thread.
-//
 // MADEIRA (P4 T5, mem-graphics.md section 7(b)(3)): 32 MB -> 8 MB. The budget
 // is a cache, not a requirement: a re-download costs one queue drain, while the
 // bytes are resident for the whole session and are exactly the kind of memory a
 // process near jetsam cannot afford to hold for a read-back that may never come.
 // Paired with the pressure-gated eviction in evictManagedMirror(), which
 // releases live mirrors instead of pinning them when headroom is low.
+
+// Small MANAGED mirrors are inexpensive, but reconstructing even a tiny one
+// drains the GPU queue. Keep a bounded working set without changing LockRect
+// visibility or discarding the CPU's authoritative bytes. Shared across devices
+// in this module; destructors may run on the encode thread.
 static std::atomic<size_t> retainedMirrorBytes{0};
 static constexpr size_t kMirrorRetentionBudget = 8u * 1024u * 1024u;
 static bool smallMirrorRetentionEnabled() {
